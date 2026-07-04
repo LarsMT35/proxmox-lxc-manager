@@ -133,9 +133,11 @@ main{padding:22px;max-width:1280px;margin:0 auto}
         <div class="actions">
           <button @click="check(c)" :disabled="c.checking || c.status!=='running'">
             {{ c.checking ? 'Prüfe…' : 'Updates prüfen' }}</button>
-          <button class="primary" @click="startWizard(c)"
+          <button v-if="c.active_job_id" class="primary" @click="reopenWizard(c)">Wizard öffnen</button>
+          <button v-else class="primary" @click="startWizard(c)"
                   :disabled="c.busy || c.status!=='running'">Update-Wizard</button>
           <button v-if="c.configured===false" @click="openAdopt(c)">Integrieren</button>
+          <button v-else @click="openEdit(c)">Bearbeiten</button>
           <button @click="showHistory(c)">Verlauf</button>
         </div>
       </div>
@@ -209,9 +211,9 @@ main{padding:22px;max-width:1280px;margin:0 auto}
   <!-- ============ ADOPT (neuen Container integrieren) ============ -->
   <div class="overlay" v-if="adopt">
     <div class="modal" style="width:min(560px,100%)">
-      <header><h1>Container integrieren · <b>{{ adopt.name }}</b> <span class="ctid">CT {{ adopt.ctid }}</span></h1></header>
+      <header><h1>{{ adopt.edit ? 'Container bearbeiten' : 'Container integrieren' }} · <b>{{ adopt.name }}</b> <span class="ctid">CT {{ adopt.ctid }}</span></h1></header>
       <div class="form">
-        <p style="color:var(--dim);font-size:13px;margin:0">Dieser Container wurde auf dem Host erkannt, ist aber
+        <p v-if="!adopt.edit" style="color:var(--dim);font-size:13px;margin:0">Dieser Container wurde auf dem Host erkannt, ist aber
         noch nicht in <code>containers.yaml</code> hinterlegt. Nach dem Integrieren gelten Kritikalität,
         Gruppen-Sperren und Backup-Erinnerung dauerhaft – auch nach Neustarts.</p>
         <label>Name
@@ -235,7 +237,8 @@ main{padding:22px;max-width:1280px;margin:0 auto}
       </div>
       <div class="wfooter">
         <button class="primary" @click="submitAdopt" :disabled="!adopt.form.name || adopt.saving">
-          {{ adopt.saving ? 'Speichere…' : 'Integrieren' }}</button>
+          {{ adopt.saving ? 'Speichere…' : (adopt.edit ? 'Speichern' : 'Integrieren') }}</button>
+        <button v-if="adopt.edit" class="danger" @click="removeContainer" :disabled="adopt.saving">Entfernen</button>
         <div class="spacer"></div>
         <button @click="adopt=null">Abbrechen</button>
       </div>
@@ -343,7 +346,13 @@ createApp({
     confirmStep(skip){ this.send({type:'confirm', skip}); this.wizard.confirm=null; },
     pause(){ this.send({type:'pause'}); this.wizard.state='paused'; },
     resume(){ this.send({type:'resume'}); this.wizard.state='running'; },
-    abort(){ if(confirm('Job wirklich abbrechen?')) this.send({type:'abort'}); },
+    async abort(){
+      if(!confirm('Job wirklich abbrechen?')) return;
+      this.send({type:'abort'});
+      // REST fallback so a job is released even if the websocket is gone
+      try{ if(this.wizard) await this.api(`/api/jobs/${this.wizard.id}/abort`, {method:'POST'}); }
+      catch(e){}
+    },
     closeWizard(){ if(this.ws) this.ws.close(); this.ws=null; this.wizard=null; this.load(); },
     stLabel(s){ return {pending:'wartet',running:'läuft',success:'ok',failed:'fehler',skipped:'übersprungen'}[s]||s; },
     async planSafeUpdate(){
@@ -351,19 +360,49 @@ createApp({
       catch(e){ this.error = e.message; }
     },
     openAdopt(c){
-      this.adopt = {ctid: c.ctid, name: c.name, saving: false,
+      this.adopt = {ctid: c.ctid, name: c.name, edit: false, saving: false,
         form: {name: c.name, role: '', criticality: 'normal', group: '',
                validate_command: '', backup_reminder: false}};
+    },
+    openEdit(c){
+      this.adopt = {ctid: c.ctid, name: c.name, edit: true, saving: false,
+        form: {name: c.name, role: c.role || '',
+               criticality: c.criticality || 'normal', group: c.group || '',
+               validate_command: c.validate_command || '',
+               backup_reminder: (c.flags||[]).includes('backup_reminder')}};
     },
     async submitAdopt(){
       const a = this.adopt; if(!a) return;
       a.saving = true;
       try{
-        await this.api(`/api/containers/${a.ctid}/adopt`,
-          {method:'POST', body: JSON.stringify(a.form)});
+        const method = a.edit ? 'PUT' : 'POST';
+        const path = a.edit ? `/api/containers/${a.ctid}`
+                            : `/api/containers/${a.ctid}/adopt`;
+        await this.api(path, {method, body: JSON.stringify(a.form)});
         this.adopt = null; this.load();
       }catch(e){ this.error = e.message; }
       a.saving = false;
+    },
+    async removeContainer(){
+      const a = this.adopt; if(!a) return;
+      if(!confirm(`CT ${a.ctid} aus der Konfiguration entfernen? Der Container selbst bleibt unberührt und erscheint danach wieder als „neu".`)) return;
+      a.saving = true;
+      try{
+        await this.api(`/api/containers/${a.ctid}`, {method:'DELETE'});
+        this.adopt = null; this.load();
+      }catch(e){ this.error = e.message; }
+      a.saving = false;
+    },
+    async reopenWizard(c){
+      try{
+        const job = await this.api(`/api/containers/${c.ctid}/active-job`);
+        this.attachWizard(job, job.ctName || c.name);
+        try{
+          const rows = await this.api(`/api/jobs/${job.id}/log`);
+          this.wizard.lines = rows.map(r => r.line);
+          this.scrollTerm();
+        }catch(e){}
+      }catch(e){ this.error = e.message; this.load(); }
     },
     async showHistory(c){
       try{ this.hist = {name:c.name, rows: await this.api(`/api/containers/${c.ctid}/history`)}; }

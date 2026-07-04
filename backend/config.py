@@ -59,9 +59,10 @@ class Config:
             return []
         return self.exclusive_groups.get(group, [])
 
-    def adopt_container(self, meta: ContainerMeta) -> None:
-        """Register a newly discovered container: persist it to the YAML
-        config (comments are preserved) and activate it in memory."""
+    def save_container(self, meta: ContainerMeta) -> None:
+        """Create or update a container entry: persist it to the YAML config
+        (comments are preserved) and activate it in memory. Handles moving a
+        container to a different exclusive group."""
         entry: dict[str, Any] = {"name": meta.name}
         if meta.role:
             entry["role"] = meta.role
@@ -74,30 +75,72 @@ class Config:
             entry["validate_command"] = meta.validate_command
         _persist_container(self.path, meta.ctid, entry, meta.group)
         self.containers[meta.ctid] = meta
-        if meta.group:
-            members = self.exclusive_groups.setdefault(meta.group, [])
-            if meta.ctid not in members:
-                members.append(meta.ctid)
+        self._sync_group_memory(meta.ctid, meta.group)
+
+    # backwards-compatible alias
+    adopt_container = save_container
+
+    def remove_container(self, ctid: int) -> None:
+        """Remove a container from the config (the container itself is not
+        touched – it will simply reappear as a discovered/‘neu’ entry)."""
+        ctid = int(ctid)
+        _persist_container(self.path, ctid, None, None)
+        self.containers.pop(ctid, None)
+        self._sync_group_memory(ctid, None)
+
+    def _sync_group_memory(self, ctid: int, group: str | None) -> None:
+        ctid = int(ctid)
+        for g in list(self.exclusive_groups.keys()):
+            members = self.exclusive_groups[g]
+            if ctid in members and g != group:
+                members.remove(ctid)
+            if not members:
+                self.exclusive_groups.pop(g, None)
+        if group:
+            members = self.exclusive_groups.setdefault(group, [])
+            if ctid not in members:
+                members.append(ctid)
 
 
-def _persist_container(path: str, ctid: int, entry: dict[str, Any],
+def _persist_container(path: str, ctid: int, entry: dict[str, Any] | None,
                        group: str | None) -> None:
-    """Round-trip edit of containers.yaml so existing comments survive."""
+    """Round-trip edit of containers.yaml so existing comments survive.
+    entry=None deletes the container. The container id is removed from every
+    exclusive group first, then re-added to `group` if given."""
     from ruamel.yaml import YAML
 
     rt = YAML()
     rt.preserve_quotes = True
     with open(path, "r", encoding="utf-8") as fh:
         doc = rt.load(fh) or {}
-    if doc.get("containers") is None:
-        doc["containers"] = {}
-    doc["containers"][int(ctid)] = entry
+
+    ctid = int(ctid)
+    if entry is None:
+        containers = doc.get("containers")
+        if containers is not None:
+            containers.pop(ctid, None)
+            containers.pop(str(ctid), None)
+    else:
+        if doc.get("containers") is None:
+            doc["containers"] = {}
+        doc["containers"].pop(str(ctid), None)
+        doc["containers"][ctid] = entry
+
+    groups = doc.get("exclusive_groups")
+    if groups is not None:
+        for g in list(groups.keys()):
+            members = groups[g]
+            if members and ctid in members:
+                members.remove(ctid)
+            if not members:
+                del groups[g]
     if group:
         if doc.get("exclusive_groups") is None:
             doc["exclusive_groups"] = {}
         members = doc["exclusive_groups"].setdefault(group, [])
-        if int(ctid) not in members:
-            members.append(int(ctid))
+        if ctid not in members:
+            members.append(ctid)
+
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         rt.dump(doc, fh)

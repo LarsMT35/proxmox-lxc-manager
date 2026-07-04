@@ -74,9 +74,12 @@ async def containers() -> list[dict]:
             "criticality": meta.criticality,
             "group": meta.group,
             "flags": meta.flags,
+            "validate_command": meta.validate_command,
             "os": None, "uptime": None, "usage": None,
             "updates": _update_cache.get(c["ctid"], {"state": "unknown"}),
             "busy": wizards.busy_reason(c["ctid"]) is not None,
+            # id of a job still occupying this CT, so the UI can re-attach
+            "active_job_id": (j.id if (j := wizards.active_job(c["ctid"])) else None),
         }
         if c["status"] == "running":
             os_r, up, usage = await asyncio.gather(
@@ -114,6 +117,27 @@ async def start_wizard(ctid: int) -> dict:
     return job.snapshot()
 
 
+@app.get("/api/containers/{ctid}/active-job", dependencies=[Depends(auth)])
+async def active_job(ctid: int) -> dict:
+    """Return the job currently occupying this container so a client can
+    re-attach to it (instead of the card showing a dead, disabled button)."""
+    job = wizards.active_job(ctid)
+    if not job:
+        raise HTTPException(404, "kein laufender Job für diesen Container")
+    return {**job.snapshot(), "ctName": cfg.meta(ctid).name}
+
+
+@app.post("/api/jobs/{job_id}/abort", dependencies=[Depends(auth)])
+async def abort_job(job_id: str) -> dict:
+    """Abort a job over REST – works even if no websocket is attached, so a
+    forgotten confirmation step can never block a container forever."""
+    job = wizards.jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "unknown job")
+    job.abort()
+    return {"aborted": True, "id": job_id}
+
+
 class AdoptBody(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     role: str = Field(default="", max_length=64)
@@ -123,12 +147,7 @@ class AdoptBody(BaseModel):
     validate_command: str | None = Field(default=None, max_length=200)
 
 
-@app.post("/api/containers/{ctid}/adopt", dependencies=[Depends(auth)])
-async def adopt_container(ctid: int, body: AdoptBody) -> dict:
-    """Persist a container discovered via `pct list` into containers.yaml
-    so criticality, groups and flags survive restarts."""
-    if ctid in cfg.containers:
-        raise HTTPException(409, f"CT {ctid} ist bereits konfiguriert.")
+def _meta_from_body(ctid: int, body: AdoptBody) -> ContainerMeta:
     if body.criticality not in ("critical", "normal", "low"):
         raise HTTPException(422, "criticality muss critical|normal|low sein")
     group = (body.group or "").strip() or None
@@ -140,16 +159,49 @@ async def adopt_container(ctid: int, body: AdoptBody) -> dict:
     validate_command = (body.validate_command or "").strip() or None
     if validate_command:
         flags.append("validate_config")
-    meta = ContainerMeta(ctid=ctid, name=body.name.strip(),
+    return ContainerMeta(ctid=ctid, name=body.name.strip(),
                          role=body.role.strip(), criticality=body.criticality,
                          group=group, flags=flags,
                          validate_command=validate_command)
+
+
+def _save_meta(meta: ContainerMeta) -> dict:
     try:
-        cfg.adopt_container(meta)
+        cfg.save_container(meta)
     except OSError as e:
         raise HTTPException(500, f"Konfiguration konnte nicht gespeichert werden: {e}")
-    return {"ctid": ctid, "name": meta.name, "criticality": meta.criticality,
-            "group": meta.group, "flags": meta.flags, "configured": True}
+    return {"ctid": meta.ctid, "name": meta.name, "role": meta.role,
+            "criticality": meta.criticality, "group": meta.group,
+            "flags": meta.flags, "validate_command": meta.validate_command,
+            "configured": True}
+
+
+@app.post("/api/containers/{ctid}/adopt", dependencies=[Depends(auth)])
+async def adopt_container(ctid: int, body: AdoptBody) -> dict:
+    """Persist a newly discovered container into containers.yaml so
+    criticality, groups and flags survive restarts."""
+    if ctid in cfg.containers:
+        raise HTTPException(409, f"CT {ctid} ist bereits konfiguriert.")
+    return _save_meta(_meta_from_body(ctid, body))
+
+
+@app.put("/api/containers/{ctid}", dependencies=[Depends(auth)])
+async def edit_container(ctid: int, body: AdoptBody) -> dict:
+    """Update an already-configured container (create-or-update)."""
+    return _save_meta(_meta_from_body(ctid, body))
+
+
+@app.delete("/api/containers/{ctid}", dependencies=[Depends(auth)])
+async def delete_container(ctid: int) -> dict:
+    """Remove a container from the config. The container itself is untouched –
+    it reappears as a discovered ('neu') entry."""
+    if ctid not in cfg.containers:
+        raise HTTPException(404, f"CT {ctid} ist nicht konfiguriert.")
+    try:
+        cfg.remove_container(ctid)
+    except OSError as e:
+        raise HTTPException(500, f"Konfiguration konnte nicht gespeichert werden: {e}")
+    return {"ctid": ctid, "configured": False}
 
 
 @app.post("/api/update-all-safe", dependencies=[Depends(auth)])
@@ -214,6 +266,14 @@ async def ws_job(ws: WebSocket, job_id: str) -> None:
     q: asyncio.Queue = asyncio.Queue()
     job.subscribers.append(q)
     await ws.send_json({"type": "state", **job.snapshot()})
+    # if the job is parked at a confirmation step, replay it so a client that
+    # (re-)attached after the prompt was first sent still sees the dialog
+    if job.state == "waiting_confirm" and 0 <= job.current < len(job.steps):
+        step = job.steps[job.current]
+        shown = step.command or f"pct {step.host_action} {job.ctid}"
+        await ws.send_json({"type": "confirm_required", "index": job.current,
+                            "command": shown, "checkbox": step.checkbox,
+                            "optional": step.optional, "job_id": job.id})
 
     async def sender() -> None:
         while True:

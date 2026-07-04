@@ -10,6 +10,7 @@ interpolation with user input. CT IDs are validated as integers before use.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shlex
 from dataclasses import dataclass
@@ -18,6 +19,12 @@ from typing import AsyncIterator, Callable
 from .config import Config
 
 APT_ENV = "DEBIAN_FRONTEND=noninteractive"
+
+# Writable location for ssh's known_hosts. The systemd unit runs with
+# ProtectHome=read-only, so /root/.ssh is not writable; /var/lib/... is.
+_STATE_DIR = (os.path.dirname(os.environ.get(
+    "LXC_COMMANDER_DB", "/var/lib/lxc-commander/commander.db"))
+    or "/var/lib/lxc-commander")
 
 
 @dataclass
@@ -96,9 +103,14 @@ class LocalRunner(BaseRunner):
 
 class SSHRunner(BaseRunner):
     def __init__(self, host: str, user: str = "root",
-                 port: int = 22, key_file: str | None = None):
-        self.base = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
-                     "-p", str(port)]
+                 port: int = 22, key_file: str | None = None,
+                 known_hosts: str | None = None):
+        self.base = ["ssh", "-o", "BatchMode=yes",
+                     "-o", "StrictHostKeyChecking=accept-new"]
+        if known_hosts:
+            # keep ssh from trying to write /root/.ssh/known_hosts (read-only)
+            self.base += ["-o", f"UserKnownHostsFile={known_hosts}"]
+        self.base += ["-p", str(port)]
         if key_file:
             self.base += ["-i", key_file]
         self.base.append(f"{user}@{host}")
@@ -116,9 +128,14 @@ class Proxmox:
         mode = cfg.proxmox.get("mode", "local")
         if mode == "ssh":
             s = cfg.proxmox.get("ssh", {})
+            try:
+                os.makedirs(_STATE_DIR, exist_ok=True)
+            except OSError:
+                pass
             self.runner: BaseRunner = SSHRunner(
                 host=s.get("host"), user=s.get("user", "root"),
                 port=int(s.get("port", 22)), key_file=s.get("key_file"),
+                known_hosts=os.path.join(_STATE_DIR, "known_hosts"),
             )
         else:
             self.runner = LocalRunner()

@@ -136,13 +136,24 @@ def build_update_steps(meta: ContainerMeta, snapshot_hint: bool) -> list[Step]:
 
 
 class WizardManager:
+    _ACTIVE_STATES = ("pending", "running", "paused", "waiting_confirm")
+
     def __init__(self, cfg: Config, px: Proxmox, store: Store):
         self.cfg, self.px, self.store = cfg, px, store
         self.jobs: dict[str, Job] = {}
+        self.active: dict[int, Job] = {}      # ctid -> currently running job
         self.ct_locks: dict[int, asyncio.Lock] = {}
         self.group_locks: dict[str, asyncio.Lock] = {}
         n = int(cfg.safety.get("max_parallel_critical", 1))
         self.critical_sem = asyncio.Semaphore(max(1, n))
+
+    def active_job(self, ctid: int) -> Job | None:
+        """The job currently occupying this container (so the UI can
+        re-attach instead of leaving a dead, disabled button behind)."""
+        job = self.active.get(int(ctid))
+        if job and job.state in self._ACTIVE_STATES:
+            return job
+        return None
 
     # ----- lock helpers ------------------------------------------------------
     def _ct_lock(self, ctid: int) -> asyncio.Lock:
@@ -174,6 +185,7 @@ class WizardManager:
                   steps=build_update_steps(
                       meta, bool(self.cfg.safety.get("snapshot_before_critical", True))))
         self.jobs[job.id] = job
+        self.active[ctid] = job
         self.store.job_create(job.id, ctid, "update")
         asyncio.create_task(self._run(job))
         return job
@@ -181,18 +193,24 @@ class WizardManager:
     async def _run(self, job: Job) -> None:
         meta = job.meta
         gl = self._group_lock(meta.group)
-        async with self._ct_lock(job.ctid):
-            if gl:
-                await gl.acquire()
-            if meta.is_critical:
-                await self.critical_sem.acquire()
-            try:
-                await self._run_steps(job)
-            finally:
-                if meta.is_critical:
-                    self.critical_sem.release()
+        try:
+            async with self._ct_lock(job.ctid):
                 if gl:
-                    gl.release()
+                    await gl.acquire()
+                if meta.is_critical:
+                    await self.critical_sem.acquire()
+                try:
+                    await self._run_steps(job)
+                finally:
+                    if meta.is_critical:
+                        self.critical_sem.release()
+                    if gl:
+                        gl.release()
+        finally:
+            # release the "busy" marker so the container is actionable again,
+            # even if the job failed/was aborted with no websocket attached
+            if self.active.get(job.ctid) is job:
+                self.active.pop(job.ctid, None)
 
     async def _run_steps(self, job: Job) -> None:
         job.state = "running"
