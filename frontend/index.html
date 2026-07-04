@@ -4,7 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LXC Commander</title>
-<script src="https://unpkg.com/vue@3.4.27/dist/vue.global.prod.js"></script>
+<!-- Vue wird lokal ausgeliefert (kein externer CDN-Abruf → funktioniert auch
+     ohne Internet/hinter DNS-Filter). CDN nur als Notfall-Fallback. -->
+<script src="/static/vue.global.prod.js"></script>
+<script>
+  window.Vue || document.write(
+    '<script src="https://unpkg.com/vue@3.4.27/dist/vue.global.prod.js"><\/script>');
+</script>
 <style>
 :root{
   --bg:#0b1018; --panel:#121a26; --panel2:#0e1520; --line:#1e2a3a;
@@ -145,7 +151,7 @@ main{padding:22px;max-width:1280px;margin:0 auto}
   </main>
 
   <!-- ============ WIZARD MODAL ============ -->
-  <div class="overlay" v-if="wizard" @keydown.esc="null">
+  <div class="overlay" v-if="wizard">
     <div class="modal">
       <header>
         <h1>Update-Wizard · <b>{{ wizard.ctName }}</b> <span class="ctid">CT {{ wizard.ctid }}</span></h1>
