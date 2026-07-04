@@ -1,0 +1,67 @@
+# LXC Commander – Konfiguration
+#
+# Alle LXC-Container des Hosts werden automatisch erkannt (pct list) und im
+# Dashboard angezeigt. Container, die hier (noch) nicht eingetragen sind,
+# erscheinen mit Kritikalität "normal" und dem Tag »neu« – sie können direkt
+# im Dashboard über »Integrieren« in diese Datei übernommen werden.
+#
+# mode:
+#   local = App läuft direkt auf dem Proxmox-Host (pct wird lokal ausgeführt)
+#   ssh   = App läuft in einem eigenen LXC/VM und verbindet sich per SSH zum Host
+proxmox:
+  mode: local            # local | ssh
+  ssh:
+    host: 192.168.1.2    # Proxmox-Host (nur bei mode: ssh)
+    user: root
+    port: 22
+    key_file: /opt/lxc-commander/keys/id_ed25519
+
+server:
+  bind: 0.0.0.0
+  port: 8420
+  # Einfacher Zugriffsschutz (hinter NGINX zusätzlich BasicAuth/SSO empfohlen!)
+  # Der Installer ersetzt den Platzhalter automatisch durch einen Zufalls-Token.
+  auth_token: "CHANGE-ME-LONG-RANDOM-TOKEN"
+
+safety:
+  # Maximal EIN kritischer Container gleichzeitig in Bearbeitung
+  max_parallel_critical: 1
+  # Nicht-kritische Container: sequenziell im "Update all (safe mode)"
+  max_parallel_noncritical: 1
+  # Snapshot-Empfehlung vor Updates kritischer Container
+  snapshot_before_critical: true
+
+# Gruppen mit gegenseitigem Ausschluss: Container derselben Gruppe
+# dürfen NIE gleichzeitig aktualisiert oder neugestartet werden.
+# Beispiel:
+#
+# exclusive_groups:
+#   dns: [160, 161]
+
+# Container-Metadaten. Felder:
+#   name              Anzeigename
+#   role              Beschreibung/Rolle
+#   criticality       critical | normal | low
+#   group             Exklusiv-Gruppe (siehe exclusive_groups)
+#   flags             require_explicit_confirm, backup_reminder, validate_config
+#   validate_command  Befehl zur Konfig-Prüfung nach dem Update (z. B. "nginx -t")
+#
+# Beispiel:
+#
+# containers:
+#   160:
+#     name: AdGuard
+#     role: "DNS / Filtering"
+#     criticality: critical
+#     group: dns
+#   165:
+#     name: Vaultwarden
+#     role: "Password Manager"
+#     criticality: critical
+#     flags: [require_explicit_confirm, backup_reminder]
+#   199:
+#     name: NGINX
+#     role: "Reverse Proxy / Ingress"
+#     criticality: critical
+#     flags: [validate_config]
+#     validate_command: "nginx -t"
