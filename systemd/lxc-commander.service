@@ -1,0 +1,19 @@
+[Unit]
+Description=LXC Commander - Proxmox LXC Update Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/lxc-commander
+Environment=LXC_COMMANDER_CONFIG=/opt/lxc-commander/config/containers.yaml
+Environment=LXC_COMMANDER_DB=/var/lib/lxc-commander/commander.db
+ExecStart=/opt/lxc-commander/venv/bin/uvicorn backend.main:app --host 0.0.0.0 --port 8420
+Restart=on-failure
+RestartSec=5
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
